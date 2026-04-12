@@ -167,36 +167,107 @@ def get_live_price(token_id: str):
             return p
     return None
 
-def resolve_trade_pnl(trade: dict) -> dict:
+def resolve_trade_pnl(trade: dict, budget: dict) -> dict:
+    """
+    Atualiza o P&L de um trade aberto com base no preço atual do mercado.
+    Quando o mercado resolve (preco >= 0.97 ou <= 0.03), fecha o trade,
+    calcula o retorno final e credita o saldo da carteira.
+
+    Logica realista do Polymarket:
+      - Compraste tokens a `entry` USDC cada
+      - Se ganhas: cada token vale 1 USDC -> payout = tokens * 1.0
+      - Se perdes: cada token vale 0 USDC -> payout = 0
+    """
     if "CLOSED" in trade.get("status", ""):
         return trade
+
+    # Tentar obter preco ao vivo via token_id
     token_id = trade.get("token_id", "")
-    current_price = get_live_price(token_id)
+    current_price = get_live_price(token_id) if token_id else None
+
+    # Fallback: buscar via conditionId na Gamma API
     if current_price is None:
+        cid = trade.get("condition_id", "")
+        if cid:
+            mkt = _get(f"{GAMMA_API}/markets", {"conditionId": cid})
+            if isinstance(mkt, list) and mkt:
+                mkt = mkt[0]
+            if isinstance(mkt, dict):
+                # Mercado resolvido?
+                if mkt.get("closed") or mkt.get("resolved"):
+                    winning = str(mkt.get("winningOutcome") or "").upper()
+                    outcome = str(trade.get("outcome") or "").upper()
+                    if winning and outcome and winning in outcome:
+                        current_price = 1.0
+                    elif winning:
+                        current_price = 0.0
+                # Mercado ainda aberto: ler preco do token
+                if current_price is None:
+                    tokens_raw = mkt.get("tokens") or mkt.get("outcomes") or []
+                    outcome_trade = str(trade.get("outcome") or "").upper()
+                    for tok in tokens_raw if isinstance(tokens_raw, list) else []:
+                        tok_name = str(tok.get("outcome") or tok.get("name") or "").upper()
+                        if tok_name and tok_name in outcome_trade:
+                            p = tok.get("price") or tok.get("lastTradePrice")
+                            if p is not None:
+                                try:
+                                    current_price = float(p)
+                                except Exception:
+                                    pass
+                            break
+
+    if current_price is None:
+        trade["updated_at"] = now()
         return trade
 
-    side  = trade.get("side", "BUY")
-    entry = trade.get("price", 0)
-    size  = trade.get("usdc_size", 0)
-    if entry <= 0:
+    entry  = float(trade.get("price", 0))
+    size   = float(trade.get("usdc_size", 0))
+    wallet = trade.get("wallet", "")
+
+    if entry <= 0 or size <= 0:
         return trade
 
-    if side == "BUY":
-        tokens = size / entry
-        trade["pnl"] = round(tokens * current_price - size, 4)
-    else:
-        tokens = size / (1 - entry) if entry < 1 else size
-        trade["pnl"] = round(tokens * (1 - current_price) - size, 4)
+    # Tokens comprados = USDC investidos / preco de entrada
+    tokens_bought = size / entry
 
-    if current_price >= 0.97:
-        trade["status"] = "CLOSED_WIN" if side == "BUY" else "CLOSED_LOSS"
-    elif current_price <= 0.03:
-        trade["status"] = "CLOSED_LOSS" if side == "BUY" else "CLOSED_WIN"
-    else:
-        trade["status"] = "OPEN"
-
+    # P&L nao realizado (mark-to-market)
+    trade["pnl"]           = round(tokens_bought * current_price - size, 4)
     trade["current_price"] = round(current_price, 4)
-    trade["updated_at"] = now()
+    trade["updated_at"]    = now()
+
+    # Verificar se o mercado resolveu
+    market_resolved = current_price >= 0.97 or current_price <= 0.03
+
+    if market_resolved:
+        won = current_price >= 0.97
+
+        if won:
+            payout          = round(tokens_bought * 1.0, 4)
+            trade["pnl"]    = round(payout - size, 4)
+            trade["status"] = "CLOSED_WIN"
+        else:
+            payout          = 0.0
+            trade["pnl"]    = round(-size, 4)
+            trade["status"] = "CLOSED_LOSS"
+
+        trade["payout"]    = payout
+        trade["closed_at"] = now()
+
+        # Creditar retorno no saldo da carteira
+        if wallet and wallet in budget:
+            budget[wallet] = round(budget[wallet] + payout, 4)
+            log(f"  Fechado [{trade['status']}] {trade['title'][:35]}  "
+                f"payout={payout:.2f}  P&L={trade['pnl']:+.2f}  saldo={budget[wallet]:.2f}")
+            icon = "WIN" if won else "LOSS"
+            telegram_send(
+                f"{'✅' if won else '❌'} <b>TRADE FECHADO — {icon}</b>\n"
+                f"📌 {trade['title'][:55]}\n"
+                f"💵 Entrada: {entry:.3f} → Resolução: {current_price:.3f}\n"
+                f"💰 Payout: <b>{payout:.2f} USDC</b>  "
+                f"P&amp;L: <b>{trade['pnl']:+.2f}</b>\n"
+                f"💼 Saldo: <b>{budget[wallet]:.2f} USDC</b>"
+            )
+
     return trade
 
 # ══════════════════════════════════════════════
@@ -253,23 +324,28 @@ def generate_dashboard(trades, budget, wallets, iteration) -> str:
     for t in reversed(trades[-50:]):
         st = t.get("status", "OPEN")
         if "WIN" in st:
-            badge = '<span class="badge win">WIN</span>'
+            badge = '<span class="badge win">WIN ✅</span>'
         elif "LOSS" in st:
-            badge = '<span class="badge loss">LOSS</span>'
+            badge = '<span class="badge loss">LOSS ❌</span>'
         else:
             badge = '<span class="badge open">OPEN</span>'
-        pnl_val = t.get("pnl", 0.0)
-        pnl_cls = "pos" if pnl_val >= 0 else "neg"
-        cur_p   = t.get("current_price", t["price"])
+        pnl_val  = t.get("pnl", 0.0)
+        pnl_cls  = "pos" if pnl_val >= 0 else "neg"
+        cur_p    = t.get("current_price", t["price"])
         side_cls = "buy" if t["side"] == "BUY" else "sell"
+        payout   = t.get("payout", "—")
+        payout_str = f"{payout:.2f}" if isinstance(payout, float) else "—"
+        closed_t = t.get("closed_at", "")
+        time_str = closed_t if closed_t else t["timestamp"]
         rows += f"""
         <tr>
-          <td>{t['timestamp']}</td>
+          <td>{time_str}</td>
           <td class="mono">{t['wallet'][:8]}…{t['wallet'][-4:]}</td>
           <td>{t['title'][:42]}</td>
           <td class="{side_cls}">{t['side']}</td>
           <td class="mono">{t['price']:.3f} → {cur_p:.3f}</td>
           <td class="mono">{t['usdc_size']:.2f}</td>
+          <td class="mono">{payout_str}</td>
           <td class="mono {pnl_cls}">{pnl_val:+.4f}</td>
           <td>{badge}</td>
         </tr>"""
@@ -393,7 +469,7 @@ def generate_dashboard(trades, budget, wallets, iteration) -> str:
 
   <h2>Últimos {min(50, len(trades))} trades</h2>
   <div class="table-wrap">
-    {'<table><thead><tr><th>Hora</th><th>Carteira</th><th>Mercado</th><th>Side</th><th>Preço entrada→atual</th><th>USDC</th><th>P&L</th><th>Status</th></tr></thead><tbody>' + rows + '</tbody></table>' if trades else '<div class="empty">Aguardando trades…</div>'}
+    {'<table><thead><tr><th>Hora</th><th>Carteira</th><th>Mercado</th><th>Side</th><th>Preço entrada→atual</th><th>Investido</th><th>Payout</th><th>P&L</th><th>Status</th></tr></thead><tbody>' + rows + '</tbody></table>' if trades else '<div class="empty">Aguardando trades…</div>'}
   </div>
 
 </div>
@@ -693,11 +769,11 @@ def fase3_monitorizar(wallets):
             seen_ids[w] = seen
             time.sleep(0.4)
 
-        # Atualizar P&L real
+        # Atualizar P&L real e fechar trades resolvidos
         with _lock:
             for i, t in enumerate(_state["trades"]):
                 if t.get("status") == "OPEN":
-                    _state["trades"][i] = resolve_trade_pnl(t)
+                    _state["trades"][i] = resolve_trade_pnl(t, budget)
             _state["iteration"] = iteration
             _state["status"] = f"A monitorizar… ciclo {iteration}"
 
